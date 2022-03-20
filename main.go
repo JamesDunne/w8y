@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,6 +21,16 @@ func main() {
 	if processPath == "" {
 		log.Println("missing required W8Y_EXEC env var! must be a path to a process to execute; env and args are copied from current process")
 		os.Exit(2)
+	}
+	if processPath, err = exec.LookPath(processPath); err != nil {
+		log.Printf("failed to find process: %v\n", err)
+		os.Exit(2)
+	}
+
+	var workItemArgPos int
+	var workItemArgAdd = false
+	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_ARG_POS")); err == nil {
+		workItemArgAdd = true
 	}
 
 	redisUrl := os.Getenv("W8Y_REDIS_URL")
@@ -79,64 +88,118 @@ func main() {
 	// check list length up front so we don't end up circling around the list forever. the list length may change during
 	// iteration but this is okay since we can always restart and pick up the new list size.
 	var listLen int64
-	log.Printf("checking length of list '%s'\n", listKey)
+	log.Printf("checking length of work list %#v\n", listKey)
 	if listLen, err = rds.LLen(ctx, listKey).Result(); err != nil {
 		log.Println(err)
 		os.Exit(2)
 	}
-	log.Printf("length of list '%s' is %v\n", listKey, listLen)
+	log.Printf("length of work list %#v is %v\n", listKey, listLen)
 	if listLen <= 0 {
 		log.Println("work list is empty; no work to do")
 		os.Exit(1)
 	}
 
-	var listItem string
+	var workItem string
 	var procKeyExists int64 = 1
 
 	// iterate once through the list of items:
 	for i := int64(0); i < listLen; i++ {
 		// pop from left side of list and atomically append to right side of list:
-		if listItem, err = rds.LMove(ctx, listKey, listKey, "left", "right").Result(); err != nil {
+		if workItem, err = rds.LMove(ctx, listKey, listKey, "left", "right").Result(); err != nil {
 			log.Printf("LMOVE error: %v\n", err)
 			os.Exit(2)
 		}
 
 		// check for existence of processing key:
-		procKey = procKeyPrefix + listItem
+		procKey = procKeyPrefix + workItem
 		if procKeyExists, err = rds.Exists(ctx, procKey).Result(); err != nil {
 			log.Printf("EXISTS error: %v\n", err)
 			os.Exit(2)
 		}
 		if procKeyExists == 0 {
 			// no processor key exists for this item so let's grab it:
+			log.Printf("work item available: %#v\n", workItem)
 			break
 		}
 
 		// keep going through list items, looking for one which is not being processed:
+		log.Printf("work item already processing: %#v\n", workItem)
 	}
 
 	if procKeyExists != 0 {
 		// no work to do. exit and let us be restarted again after a backoff period:
-		log.Printf("no available work item found in '%s'\n", listKey)
+		log.Printf("no available work item found in %#v\n", listKey)
 		// 0 items to return:
 		fmt.Println("0")
 		os.Exit(1)
 	}
 
-	// spawn process to process list item:
-	args := make([]string, len(os.Args))
-	copy(args, os.Args)
-	args[0] = processPath
-	cmd := exec.Command(args[0], args...)
+	cmd := prepareProcess(processPath, workItem, workItemArgPos, workItemArgAdd)
+
+	// start process:
+	log.Printf("start process: %#v\n", cmd.Args)
+	if err := cmd.Start(); err != nil {
+		log.Printf("start process error: %v\n", err)
+		os.Exit(2)
+	}
+
+	// run a keepalive thread in the background:
+	isComplete := make(chan struct{})
+	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete)
+
+	// wait for process to exit:
+	err = cmd.Wait()
+
+	// mark completed:
+	isComplete <- struct{}{}
+
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		// flush remaining stderr:
+		os.Stderr.Write(exitErr.Stderr)
+		os.Exit(exitErr.ExitCode())
+	} else if err != nil {
+		log.Println(err)
+	}
+
+	os.Exit(2)
+}
+
+func prepareProcess(processPath string, workItem string, argPos int, argAdd bool) *exec.Cmd {
+	var args []string
+	osArgs := os.Args[1:]
+
+	// insert args if requested:
+	if argAdd {
+		args = make([]string, 0, len(osArgs)+1)
+
+		// handle negative values as offset from end of args:
+		if argPos < 0 {
+			argPos += len(osArgs) + 1
+		}
+		// bounds check:
+		if argPos < 0 {
+			argPos = 0
+		}
+		if argPos > len(osArgs) {
+			argPos = len(osArgs)
+		}
+
+		args = append(args, osArgs[0:argPos]...)
+		args = append(args, workItem)
+		args = append(args, osArgs[argPos:]...)
+	} else {
+		args = osArgs
+	}
+
+	// create a command with path and arguments:
+	cmd := exec.Command(processPath, args...)
 
 	// build environment variables:
 	osEnv := os.Environ()
 	env := make([]string, 0, len(osEnv)+2)
 
-	// let the process know the list item and processing key via env vars:
-	env = append(env,
-		fmt.Sprintf("W8Y_LIST_ITEM=%s", listItem),
-		fmt.Sprintf("W8Y_PROC_KEY=%s", procKey))
+	// let the process know the work item and processing key via env vars:
+	env = append(env, fmt.Sprintf("W8Y_WORK_ITEM=%s", workItem))
 
 	// copy in env vars, filtering out "W8Y_" prefixed keys:
 	for _, kv := range osEnv {
@@ -154,36 +217,11 @@ func main() {
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
 
-	// start process:
-	if err := cmd.Start(); err != nil {
-		log.Printf("start process error: %v\n", err)
-		os.Exit(2)
-	}
-
-	// run a keepalive thread in the background:
-	isComplete := int32(0)
-	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), &isComplete)
-
-	// wait for process to exit:
-	err = cmd.Wait()
-
-	// mark completed:
-	atomic.StoreInt32(&isComplete, 1)
-
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		// flush remaining stderr:
-		os.Stderr.Write(exitErr.Stderr)
-		os.Exit(exitErr.ExitCode())
-	} else if err != nil {
-		log.Println(err)
-	}
-
-	os.Exit(2)
+	return cmd
 }
 
-func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete *int32) {
+func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete <-chan struct{}) {
 	var err error
-	log.Printf("started keepAlive thread\n")
 
 	ctx := context.Background()
 
@@ -197,20 +235,24 @@ func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComple
 
 	// every duration, renew the key:
 	ticker := time.NewTicker(duration)
-	for range ticker.C {
-		if atomic.LoadInt32(isComplete) != 0 {
-			break
-		}
 
-		// push out the expiry time:
-		var updated bool
-		if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
-			log.Printf("EXPIRE '%s' error: %v\n", procKey, err)
-		}
-		if !updated {
-			log.Printf("EXPIRE '%s' was not successfully updated\n", procKey)
+loop:
+	for {
+		select {
+		case <-isComplete:
+			break loop
+		case <-ticker.C:
+			// push out the expiry time:
+			var updated bool
+			if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
+				log.Printf("EXPIRE '%s' error: %v\n", procKey, err)
+			}
+			if !updated {
+				log.Printf("EXPIRE '%s' was not successfully updated\n", procKey)
+			}
 		}
 	}
+
 	log.Printf("stopped keepAlive thread\n")
 	ticker.Stop()
 }
