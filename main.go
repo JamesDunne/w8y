@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-redis/redis/v8"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -14,8 +15,24 @@ import (
 
 func main() {
 	var err error
+
+	var silence bool
+	if os.Getenv("W8Y_LOG_SILENT") != "" {
+		silence = true
+	}
+
+	var logOut io.Writer = io.Discard
+	if !silence {
+		if fd, err := strconv.Atoi(os.Getenv("W8Y_LOG_FD")); err == nil {
+			logOut = os.NewFile(uintptr(fd), strconv.Itoa(fd))
+		} else {
+			logOut = os.Stderr
+		}
+	}
+
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
-	log.SetOutput(os.Stderr)
+	log.SetPrefix("w8y: ")
+	log.SetOutput(logOut)
 
 	processPath := os.Getenv("W8Y_EXEC")
 	if processPath == "" {
@@ -29,8 +46,13 @@ func main() {
 
 	var workItemArgPos int
 	var workItemArgAdd = false
-	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_ARG_POS")); err == nil {
+	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_EXEC_ARGN")); err == nil {
 		workItemArgAdd = true
+	}
+
+	workItemKey := os.Getenv("W8Y_ENVVAR")
+	if workItemKey == "" {
+		workItemKey = "W8Y_WORK_ITEM"
 	}
 
 	redisUrl := os.Getenv("W8Y_REDIS_URL")
@@ -39,9 +61,9 @@ func main() {
 	}
 
 	var keyPrefix string
-	keyPrefix = os.Getenv("W8Y_KEY_PREFIX")
+	keyPrefix = os.Getenv("W8Y_REDIS_KEY_PREFIX")
 	if keyPrefix == "" {
-		log.Println("warning: empty W8Y_KEY_PREFIX env var")
+		log.Println("warning: empty W8Y_REDIS_KEY_PREFIX env var; using global namespace for keys")
 	} else {
 		// make sure key prefix has a ':' suffix:
 		if !strings.HasSuffix(keyPrefix, ":") {
@@ -51,7 +73,7 @@ func main() {
 	log.Printf("key prefix = '%s'\n", keyPrefix)
 
 	var keyExpirySeconds int
-	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_KEY_EXPIRY_SECONDS")); err != nil {
+	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_REDIS_EXPIRY_SECONDS")); err != nil {
 		keyExpirySeconds = 5
 		log.Printf("key expiry is %d seconds (default)\n", keyExpirySeconds)
 	} else {
@@ -88,14 +110,14 @@ func main() {
 	// check list length up front so we don't end up circling around the list forever. the list length may change during
 	// iteration but this is okay since we can always restart and pick up the new list size.
 	var listLen int64
-	log.Printf("checking length of work list %#v\n", listKey)
+	log.Printf("checking length of %#v\n", listKey)
 	if listLen, err = rds.LLen(ctx, listKey).Result(); err != nil {
 		log.Println(err)
 		os.Exit(2)
 	}
-	log.Printf("length of work list %#v is %v\n", listKey, listLen)
+	log.Printf("length of %#v is %v\n", listKey, listLen)
 	if listLen <= 0 {
-		log.Println("work list is empty; no work to do")
+		log.Println("empty; no work to do")
 		os.Exit(1)
 	}
 
@@ -134,7 +156,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	cmd := prepareProcess(processPath, workItem, workItemArgPos, workItemArgAdd)
+	cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
 
 	// start process:
 	log.Printf("start process: %#v\n", cmd.Args)
@@ -164,7 +186,7 @@ func main() {
 	os.Exit(2)
 }
 
-func prepareProcess(processPath string, workItem string, argPos int, argAdd bool) *exec.Cmd {
+func prepareProcess(processPath string, workItemKey string, workItem string, argPos int, argAdd bool) *exec.Cmd {
 	var args []string
 	osArgs := os.Args[1:]
 
@@ -199,7 +221,7 @@ func prepareProcess(processPath string, workItem string, argPos int, argAdd bool
 	env := make([]string, 0, len(osEnv)+2)
 
 	// let the process know the work item and processing key via env vars:
-	env = append(env, fmt.Sprintf("W8Y_WORK_ITEM=%s", workItem))
+	env = append(env, fmt.Sprintf("%s=%s", workItemKey, workItem))
 
 	// copy in env vars, filtering out "W8Y_" prefixed keys:
 	for _, kv := range osEnv {
