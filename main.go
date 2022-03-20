@@ -50,7 +50,7 @@ func main() {
 		workItemArgAdd = true
 	}
 
-	workItemKey := os.Getenv("W8Y_ENVVAR")
+	workItemKey := os.Getenv("W8Y_EXEC_ENVVAR")
 	if workItemKey == "" {
 		workItemKey = "W8Y_WORK_ITEM"
 	}
@@ -90,7 +90,7 @@ func main() {
 	var options *redis.Options
 	options, err = redis.ParseURL(redisUrl)
 	if err != nil {
-		log.Printf("error parsing REDIS_URL: %v\n", err)
+		log.Printf("error parsing W8Y_REDIS_URL: %v\n", err)
 		os.Exit(2)
 	}
 
