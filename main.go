@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -147,6 +148,8 @@ func main() {
 	}
 
 	cmd.Env = env
+
+	// redirect standard file handles:
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -158,19 +161,29 @@ func main() {
 	}
 
 	// run a keepalive thread in the background:
-	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds))
+	isComplete := int32(0)
+	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), &isComplete)
 
-	// wait for process:
+	// wait for process to exit:
 	err = cmd.Wait()
+
+	// mark completed:
+	atomic.StoreInt32(&isComplete, 1)
+
 	if exitErr, ok := err.(*exec.ExitError); ok {
 		// flush remaining stderr:
 		os.Stderr.Write(exitErr.Stderr)
 		os.Exit(exitErr.ExitCode())
+	} else if err != nil {
+		log.Println(err)
 	}
+
+	os.Exit(2)
 }
 
-func keepAlive(rds *redis.Client, procKey string, expiry time.Duration) {
+func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete *int32) {
 	var err error
+	log.Printf("started keepAlive thread\n")
 
 	ctx := context.Background()
 
@@ -183,7 +196,12 @@ func keepAlive(rds *redis.Client, procKey string, expiry time.Duration) {
 	}
 
 	// every duration, renew the key:
-	for range time.Tick(duration) {
+	ticker := time.NewTicker(duration)
+	for range ticker.C {
+		if atomic.LoadInt32(isComplete) != 0 {
+			break
+		}
+
 		// push out the expiry time:
 		var updated bool
 		if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
@@ -193,4 +211,6 @@ func keepAlive(rds *redis.Client, procKey string, expiry time.Duration) {
 			log.Printf("EXPIRE '%s' was not successfully updated\n", procKey)
 		}
 	}
+	log.Printf("stopped keepAlive thread\n")
+	ticker.Stop()
 }
