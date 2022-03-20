@@ -6,6 +6,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +17,13 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
 	log.SetOutput(os.Stderr)
 
-	redisUrl := os.Getenv("REDIS_URL")
+	processPath := os.Getenv("W8Y_EXEC")
+	if processPath == "" {
+		log.Println("missing required W8Y_EXEC env var! must be a path to a process to execute; env and args are copied from current process")
+		os.Exit(2)
+	}
+
+	redisUrl := os.Getenv("W8Y_REDIS_URL")
 	if redisUrl == "" {
 		redisUrl = "redis://localhost:6379"
 	}
@@ -36,9 +43,9 @@ func main() {
 	var keyExpirySeconds int
 	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_KEY_EXPIRY_SECONDS")); err != nil {
 		keyExpirySeconds = 5
-		log.Printf("key expiry in %d seconds (default)\n", keyExpirySeconds)
+		log.Printf("key expiry is %d seconds (default)\n", keyExpirySeconds)
 	} else {
-		log.Printf("key expiry in %d seconds\n", keyExpirySeconds)
+		log.Printf("key expiry is %d seconds\n", keyExpirySeconds)
 	}
 
 	var listKey = keyPrefix + "list"
@@ -115,15 +122,75 @@ func main() {
 		os.Exit(1)
 	}
 
-	// mark this record as being processed; intended to be a keep-alive every N seconds:
-	if _, err = rds.SetEX(ctx, procKey, 1, time.Second*time.Duration(keyExpirySeconds)).Result(); err != nil {
-		log.Printf("SET EX error: %v\n", err)
+	// spawn process to process list item:
+	args := make([]string, len(os.Args))
+	copy(args, os.Args)
+	args[0] = processPath
+	cmd := exec.Command(args[0], args...)
+
+	// build environment variables:
+	osEnv := os.Environ()
+	env := make([]string, 0, len(osEnv)+2)
+
+	// let the process know the list item and processing key via env vars:
+	env = append(env,
+		fmt.Sprintf("W8Y_LIST_ITEM=%s", listItem),
+		fmt.Sprintf("W8Y_PROC_KEY=%s", procKey))
+
+	// copy in env vars, filtering out "W8Y_" prefixed keys:
+	for _, kv := range osEnv {
+		if strings.HasPrefix(kv, "W8Y_") {
+			continue
+		}
+
+		env = append(env, kv)
+	}
+
+	cmd.Env = env
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	// start process:
+	if err := cmd.Start(); err != nil {
+		log.Printf("start process error: %v\n", err)
 		os.Exit(2)
 	}
 
-	// 2 items to return; listItem and procKey:
-	fmt.Println("2")
-	fmt.Println(listItem)
-	fmt.Println(procKey)
-	os.Exit(0)
+	// run a keepalive thread in the background:
+	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds))
+
+	// wait for process:
+	err = cmd.Wait()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		// flush remaining stderr:
+		os.Stderr.Write(exitErr.Stderr)
+		os.Exit(exitErr.ExitCode())
+	}
+}
+
+func keepAlive(rds *redis.Client, procKey string, expiry time.Duration) {
+	var err error
+
+	ctx := context.Background()
+
+	// duration to renew is half of key expiry time:
+	duration := expiry / 2
+
+	// mark this record as being processed:
+	if _, err = rds.SetEX(ctx, procKey, 1, expiry).Result(); err != nil {
+		log.Printf("SET EX '%s' error: %v\n", procKey, err)
+	}
+
+	// every duration, renew the key:
+	for range time.Tick(duration) {
+		// push out the expiry time:
+		var updated bool
+		if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
+			log.Printf("EXPIRE '%s' error: %v\n", procKey, err)
+		}
+		if !updated {
+			log.Printf("EXPIRE '%s' was not successfully updated\n", procKey)
+		}
+	}
 }
