@@ -118,7 +118,7 @@ func main() {
 	log.Printf("length of %#v is %v\n", listKey, listLen)
 	if listLen <= 0 {
 		log.Println("empty; no work to do")
-		os.Exit(1)
+		os.Exit(0)
 	}
 
 	var workItem string
@@ -151,9 +151,7 @@ func main() {
 	if procKeyExists != 0 {
 		// no work to do. exit and let us be restarted again after a backoff period:
 		log.Printf("no available work item found in %#v\n", listKey)
-		// 0 items to return:
-		fmt.Println("0")
-		os.Exit(1)
+		os.Exit(0)
 	}
 
 	cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
