@@ -79,12 +79,13 @@ func main() {
 		// no processing key exists for this item so let's grab it:
 		log.Printf("work item available: %#v\n", workItem)
 
-		cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
-
-		var isComplete chan struct{}
-		var done chan struct{}
+		// run a keepalive thread in the background:
+		isComplete := make(chan struct{})
+		done := make(chan struct{})
+		go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete, done)
 
 		// start process:
+		cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
 		log.Printf("start process: %#v\n", cmd.Args)
 		exitCode = 0
 		if err := cmd.Start(); err != nil {
@@ -92,11 +93,6 @@ func main() {
 			exitCode = 2
 			goto maybeContinue
 		}
-
-		// run a keepalive thread in the background:
-		isComplete = make(chan struct{})
-		done = make(chan struct{})
-		go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete, done)
 
 		// wait for process to exit:
 		err = cmd.Wait()
