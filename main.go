@@ -16,87 +16,15 @@ import (
 func main() {
 	var err error
 
-	var silence bool
-	if os.Getenv("W8Y_LOG_SILENT") != "" {
-		silence = true
+	logF := setupLogging(err)
+	if logF != nil {
+		defer logF.Close()
 	}
 
-	var logOut io.Writer = io.Discard
-	if !silence {
-		if fd, err := strconv.Atoi(os.Getenv("W8Y_LOG_FD")); err == nil {
-			logOut = os.NewFile(uintptr(fd), strconv.Itoa(fd))
-		} else {
-			logOut = os.Stderr
-		}
-	}
+	processPath, workItemArgPos, workItemArgAdd, workItemKey, redisUrl, keyExpirySeconds, listKey, procKeyPrefix :=
+		extractEnvVars()
 
-	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
-	log.SetPrefix("w8y: ")
-	log.SetOutput(logOut)
-
-	processPath := os.Getenv("W8Y_EXEC")
-	if processPath == "" {
-		log.Println("missing required W8Y_EXEC env var! must be a path to a process to execute; env and args are copied from current process")
-		os.Exit(2)
-	}
-	if processPath, err = exec.LookPath(processPath); err != nil {
-		log.Printf("failed to find process: %v\n", err)
-		os.Exit(2)
-	}
-
-	var workItemArgPos int
-	var workItemArgAdd = false
-	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_EXEC_ARGN")); err == nil {
-		workItemArgAdd = true
-	}
-
-	workItemKey := os.Getenv("W8Y_EXEC_ENVVAR")
-	if workItemKey == "" {
-		workItemKey = "W8Y_WORK_ITEM"
-	}
-
-	redisUrl := os.Getenv("W8Y_REDIS_URL")
-	if redisUrl == "" {
-		redisUrl = "redis://localhost:6379"
-	}
-
-	var keyPrefix string
-	keyPrefix = os.Getenv("W8Y_REDIS_KEY_PREFIX")
-	if keyPrefix == "" {
-		log.Println("warning: empty W8Y_REDIS_KEY_PREFIX env var; using global namespace for keys")
-	} else {
-		// make sure key prefix has a ':' suffix:
-		if !strings.HasSuffix(keyPrefix, ":") {
-			keyPrefix += ":"
-		}
-	}
-	log.Printf("key prefix = '%s'\n", keyPrefix)
-
-	var keyExpirySeconds int
-	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_REDIS_EXPIRY_SECONDS")); err != nil {
-		keyExpirySeconds = 5
-		log.Printf("key expiry is %d seconds (default)\n", keyExpirySeconds)
-	} else {
-		log.Printf("key expiry is %d seconds\n", keyExpirySeconds)
-	}
-
-	var listKey = keyPrefix + "list"
-	var procKeyPrefix = keyPrefix + "proc:"
-	log.Printf("list key = '%s'\n", listKey)
-
-	var procKey string
-
-	// parse REDIS_URL for connection info:
-	var options *redis.Options
-	options, err = redis.ParseURL(redisUrl)
-	if err != nil {
-		log.Printf("error parsing W8Y_REDIS_URL: %v\n", err)
-		os.Exit(2)
-	}
-
-	// connect to redis:
-	var rds *redis.Client
-	rds = redis.NewClient(options)
+	rds := connectRedis(redisUrl)
 	defer func() {
 		err = rds.Close()
 		if err != nil {
@@ -123,6 +51,7 @@ func main() {
 
 	var workItem string
 	var procKeyExists int64 = 1
+	var exitCode int
 
 	// iterate once through the list of items:
 	for i := int64(0); i < listLen; i++ {
@@ -133,55 +62,183 @@ func main() {
 		}
 
 		// check for existence of processing key:
+		var procKey string
 		procKey = procKeyPrefix + workItem
 		if procKeyExists, err = rds.Exists(ctx, procKey).Result(); err != nil {
 			log.Printf("EXISTS error: %v\n", err)
 			os.Exit(2)
 		}
-		if procKeyExists == 0 {
-			// no processor key exists for this item so let's grab it:
-			log.Printf("work item available: %#v\n", workItem)
-			break
+
+		// processing key exists:
+		if procKeyExists != 0 {
+			// keep going through list items, looking for one which is not being processed:
+			log.Printf("work item already processing: %#v\n", workItem)
+			continue
 		}
 
-		// keep going through list items, looking for one which is not being processed:
-		log.Printf("work item already processing: %#v\n", workItem)
+		// no processing key exists for this item so let's grab it:
+		log.Printf("work item available: %#v\n", workItem)
+
+		cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
+
+		var isComplete chan struct{}
+		var done chan struct{}
+
+		// start process:
+		log.Printf("start process: %#v\n", cmd.Args)
+		exitCode = 0
+		if err := cmd.Start(); err != nil {
+			log.Printf("start process error: %v\n", err)
+			exitCode = 2
+			goto maybeContinue
+		}
+
+		// run a keepalive thread in the background:
+		isComplete = make(chan struct{})
+		done = make(chan struct{})
+		go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete, done)
+
+		// wait for process to exit:
+		err = cmd.Wait()
+
+		// mark completed:
+		close(isComplete)
+
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			// flush remaining stderr:
+			os.Stderr.Write(exitErr.Stderr)
+			exitCode = exitErr.ExitCode()
+		} else if err != nil {
+			log.Println(err)
+			exitCode = 2
+		}
+
+		// wait for keepAlive thread to finish:
+		<-done
+
+	maybeContinue:
+		//if exitCode == 0 {
+		//	continue
+		//}
+
+		break
 	}
 
-	if procKeyExists != 0 {
-		// no work to do. exit and let us be restarted again after a backoff period:
-		log.Printf("no available work item found in %#v\n", listKey)
-		os.Exit(0)
+	os.Exit(exitCode)
+}
+
+func setupLogging(err error) (f *os.File) {
+	var silence bool
+	if os.Getenv("W8Y_LOG_SILENT") != "" {
+		silence = true
 	}
 
-	cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
+	var logOut io.Writer = io.Discard
+	if !silence {
+		if fname := os.Getenv("W8Y_LOG_FILE"); fname != "" {
+			f, err = os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+			if err != nil {
+				fmt.Printf("failed to open file for writing: %v\n", fname)
+				os.Exit(2)
+			}
+			logOut = f
+		} else {
+			logOut = os.Stderr
+		}
+	}
 
-	// start process:
-	log.Printf("start process: %#v\n", cmd.Args)
-	if err := cmd.Start(); err != nil {
-		log.Printf("start process error: %v\n", err)
+	ts := 1
+	if val, err := strconv.Atoi(os.Getenv("W8Y_LOG_TIMESTAMP")); err == nil {
+		ts = val
+	}
+
+	if ts != 0 {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+	} else {
+		log.SetFlags(0)
+	}
+
+	log.SetPrefix("w8y: ")
+	log.SetOutput(logOut)
+
+	return
+}
+
+func connectRedis(redisUrl string) (rds *redis.Client) {
+	var err error
+
+	// parse REDIS_URL for connection info:
+	var options *redis.Options
+	options, err = redis.ParseURL(redisUrl)
+	if err != nil {
+		log.Printf("error parsing W8Y_REDIS_URL: %v\n", err)
 		os.Exit(2)
 	}
 
-	// run a keepalive thread in the background:
-	isComplete := make(chan struct{})
-	go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete)
+	// connect to redis:
+	rds = redis.NewClient(options)
+	return
+}
 
-	// wait for process to exit:
-	err = cmd.Wait()
+func extractEnvVars() (
+	processPath string,
+	workItemArgPos int,
+	workItemArgAdd bool,
+	workItemKey string,
+	redisUrl string,
+	keyExpirySeconds int,
+	listKey string,
+	procKeyPrefix string,
+) {
+	var err error
 
-	// mark completed:
-	isComplete <- struct{}{}
-
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		// flush remaining stderr:
-		os.Stderr.Write(exitErr.Stderr)
-		os.Exit(exitErr.ExitCode())
-	} else if err != nil {
-		log.Println(err)
+	processPath = os.Getenv("W8Y_EXEC")
+	if processPath == "" {
+		log.Println("missing required W8Y_EXEC env var! must be a path to a process to execute; env and args are copied from current process")
+		os.Exit(2)
+	}
+	if processPath, err = exec.LookPath(processPath); err != nil {
+		log.Printf("failed to find process: %v\n", err)
+		os.Exit(2)
 	}
 
-	os.Exit(2)
+	workItemArgAdd = false
+	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_EXEC_ARGN")); err == nil {
+		workItemArgAdd = true
+	}
+
+	workItemKey = os.Getenv("W8Y_EXEC_ENVVAR")
+	if workItemKey == "" {
+		workItemKey = "W8Y_WORK_ITEM"
+	}
+
+	redisUrl = os.Getenv("W8Y_REDIS_URL")
+	if redisUrl == "" {
+		redisUrl = "redis://localhost:6379"
+	}
+
+	keyPrefix := os.Getenv("W8Y_REDIS_KEY_PREFIX")
+	if keyPrefix == "" {
+		log.Println("warning: empty W8Y_REDIS_KEY_PREFIX env var; using global namespace for keys")
+	} else {
+		// make sure key prefix has a ':' suffix:
+		if !strings.HasSuffix(keyPrefix, ":") {
+			keyPrefix += ":"
+		}
+	}
+	log.Printf("key prefix = %#v\n", keyPrefix)
+
+	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_REDIS_EXPIRY_SECONDS")); err != nil {
+		keyExpirySeconds = 5
+		log.Printf("key expiry is %d seconds (default)\n", keyExpirySeconds)
+	} else {
+		log.Printf("key expiry is %d seconds\n", keyExpirySeconds)
+	}
+
+	listKey = keyPrefix + "list"
+	procKeyPrefix = keyPrefix + "proc:"
+	log.Printf("list key = %#v\n", listKey)
+	return
 }
 
 func prepareProcess(processPath string, workItemKey string, workItem string, argPos int, argAdd bool) *exec.Cmd {
@@ -240,7 +297,7 @@ func prepareProcess(processPath string, workItemKey string, workItem string, arg
 	return cmd
 }
 
-func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete <-chan struct{}) {
+func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete <-chan struct{}, done chan<- struct{}) {
 	var err error
 
 	ctx := context.Background()
@@ -273,6 +330,8 @@ loop:
 		}
 	}
 
-	log.Printf("stopped keepAlive thread\n")
+	//log.Printf("stopped keepAlive thread\n")
 	ticker.Stop()
+
+	close(done)
 }
