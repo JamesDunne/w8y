@@ -64,8 +64,8 @@ searched for in `$PATH` or the absolute path of an executable.
 
 Environment variables from the `w8y` process's environment are passed to the executable.
 
-Command-line arguments after the `executable` required argument are passed to the spawned process except that all
-placeholder values of `{}` are replaced with the work item value.
+Command-line arguments after the `executable` required argument are passed to the child process; all placeholder values
+of `{}` are replaced with the work item value.
 
 ## Examples
 
