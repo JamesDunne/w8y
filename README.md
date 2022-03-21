@@ -2,8 +2,7 @@
 
 ## What?
 `w8y` (pronounced _weighty_, or _waity_ if you prefer) is simply an executable wrapper that enriches the environment of
-a single instance of an executable to provide it with a work item to process via environment variables or command-line
-arguments.
+the executable to provide it with a work item to process via environment variables and/or command-line arguments.
 
 ## How?
 `w8y` reads work items from a circular redis list until one is available to process.
