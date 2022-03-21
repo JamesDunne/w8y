@@ -4,27 +4,49 @@ import (
 	"context"
 	"fmt"
 	"github.com/go-redis/redis/v8"
+	"github.com/jessevdk/go-flags"
 	"io"
 	"log"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 )
 
+type Options struct {
+	RedisUrl        string `short:"u" long:"redis-url" default:"redis://localhost:6379" description:"Redis URL to connect to"`
+	KeyPrefix       string `short:"k" long:"key-prefix" description:"Redis prefix for all keys"`
+	KeyExpiry       int    `short:"x" long:"key-expiry" default:"5" description:"Redis processing key expiry in seconds"`
+	Quiet           bool   `short:"q" long:"quiet" description:"Silence output of w8y to capture pure stdout,stderr of spawned executable"`
+	LogFile         string `short:"f" long:"log-file" description:"Log to file"`
+	NoLogTimestamps bool   `short:"t" long:"no-log-timestamps" description:"Disable inclusion of timestamps in log lines"`
+	EnvVar          string `short:"e" long:"env-var" description:"Environment variable name to set work item to"`
+	Args            struct {
+		Executable string   `positional-arg-name:"executable"`
+		Rest       []string `positional-arg-name:"args" description:"Arguments to pass to executable; use {} as a placeholder for work item value"`
+	} `positional-args:"true" required:"true"`
+}
+
 func main() {
 	var err error
 
-	logF := setupLogging(err)
+	opts := &Options{}
+	_, err = flags.NewParser(opts, flags.HelpFlag).Parse()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		return
+	}
+
+	logF := setupLogging(opts)
 	if logF != nil {
 		defer logF.Close()
 	}
 
-	processPath, workItemArgPos, workItemArgAdd, workItemKey, redisUrl, keyExpirySeconds, listKey, procKeyPrefix :=
-		extractEnvVars()
+	//fmt.Printf("%#v\n", opts)
 
-	rds := connectRedis(redisUrl)
+	validateOptions(opts)
+
+	rds := connectRedis(opts.RedisUrl)
 	defer func() {
 		err = rds.Close()
 		if err != nil {
@@ -34,6 +56,10 @@ func main() {
 	}()
 
 	ctx := context.Background()
+
+	listKey := opts.KeyPrefix + "list"
+	procKeyPrefix := opts.KeyPrefix + "proc:"
+	log.Printf("list key = %#v\n", listKey)
 
 	// check list length up front so we don't end up circling around the list forever. the list length may change during
 	// iteration but this is okay since we can always restart and pick up the new list size.
@@ -82,10 +108,10 @@ func main() {
 		// run a keepalive thread in the background:
 		isComplete := make(chan struct{})
 		done := make(chan struct{})
-		go keepAlive(rds, procKey, time.Second*time.Duration(keyExpirySeconds), isComplete, done)
+		go keepAlive(rds, procKey, time.Second*time.Duration(opts.KeyExpiry), isComplete, done)
 
 		// start process:
-		cmd := prepareProcess(processPath, workItemKey, workItem, workItemArgPos, workItemArgAdd)
+		cmd := prepareProcess(opts, workItem)
 		log.Printf("start process: %#v\n", cmd.Args)
 		exitCode = 0
 		if err := cmd.Start(); err != nil {
@@ -123,15 +149,13 @@ func main() {
 	os.Exit(exitCode)
 }
 
-func setupLogging(err error) (f *os.File) {
-	var silence bool
-	if os.Getenv("W8Y_LOG_SILENT") != "" {
-		silence = true
-	}
+func setupLogging(opts *Options) (f *os.File) {
+	silence := opts.Quiet
 
 	var logOut io.Writer = io.Discard
 	if !silence {
-		if fname := os.Getenv("W8Y_LOG_FILE"); fname != "" {
+		if fname := opts.LogFile; fname != "" {
+			var err error
 			f, err = os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 			if err != nil {
 				fmt.Printf("failed to open file for writing: %v\n", fname)
@@ -143,15 +167,10 @@ func setupLogging(err error) (f *os.File) {
 		}
 	}
 
-	ts := 1
-	if val, err := strconv.Atoi(os.Getenv("W8Y_LOG_TIMESTAMP")); err == nil {
-		ts = val
-	}
-
-	if ts != 0 {
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
-	} else {
+	if opts.NoLogTimestamps {
 		log.SetFlags(0)
+	} else {
+		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
 	}
 
 	log.SetPrefix("w8y: ")
@@ -167,7 +186,7 @@ func connectRedis(redisUrl string) (rds *redis.Client) {
 	var options *redis.Options
 	options, err = redis.ParseURL(redisUrl)
 	if err != nil {
-		log.Printf("error parsing W8Y_REDIS_URL: %v\n", err)
+		log.Printf("error parsing redis URL: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -176,119 +195,71 @@ func connectRedis(redisUrl string) (rds *redis.Client) {
 	return
 }
 
-func extractEnvVars() (
-	processPath string,
-	workItemArgPos int,
-	workItemArgAdd bool,
-	workItemKey string,
-	redisUrl string,
-	keyExpirySeconds int,
-	listKey string,
-	procKeyPrefix string,
-) {
+func validateOptions(opts *Options) {
 	var err error
 
-	processPath = os.Getenv("W8Y_EXEC")
-	if processPath == "" {
-		log.Println("missing required W8Y_EXEC env var! must be a path to a process to execute; env and args are copied from current process")
-		os.Exit(2)
-	}
-	if processPath, err = exec.LookPath(processPath); err != nil {
+	processPath := &opts.Args.Executable
+	// *processPath is guaranteed to be non-empty here thanks to flags required:true
+	if *processPath, err = exec.LookPath(*processPath); err != nil {
 		log.Printf("failed to find process: %v\n", err)
 		os.Exit(2)
 	}
 
-	workItemArgAdd = false
-	if workItemArgPos, err = strconv.Atoi(os.Getenv("W8Y_EXEC_ARGN")); err == nil {
-		workItemArgAdd = true
+	if opts.RedisUrl == "" {
+		opts.RedisUrl = "redis://localhost:6379"
 	}
 
-	workItemKey = os.Getenv("W8Y_EXEC_ENVVAR")
-	if workItemKey == "" {
-		workItemKey = "W8Y_WORK_ITEM"
-	}
-
-	redisUrl = os.Getenv("W8Y_REDIS_URL")
-	if redisUrl == "" {
-		redisUrl = "redis://localhost:6379"
-	}
-
-	keyPrefix := os.Getenv("W8Y_REDIS_KEY_PREFIX")
-	if keyPrefix == "" {
-		log.Println("warning: empty W8Y_REDIS_KEY_PREFIX env var; using global namespace for keys")
+	if opts.KeyPrefix == "" {
+		log.Println("warning: empty key-prefix; using global namespace for keys")
 	} else {
 		// make sure key prefix has a ':' suffix:
-		if !strings.HasSuffix(keyPrefix, ":") {
-			keyPrefix += ":"
+		if !strings.HasSuffix(opts.KeyPrefix, ":") {
+			opts.KeyPrefix += ":"
 		}
 	}
-	log.Printf("key prefix = %#v\n", keyPrefix)
 
-	if keyExpirySeconds, err = strconv.Atoi(os.Getenv("W8Y_REDIS_EXPIRY_SECONDS")); err != nil {
-		keyExpirySeconds = 5
-		log.Printf("key expiry is %d seconds (default)\n", keyExpirySeconds)
-	} else {
-		log.Printf("key expiry is %d seconds\n", keyExpirySeconds)
-	}
+	log.Printf("key prefix = %#v\n", opts.KeyPrefix)
+	log.Printf("key expiry is %d seconds\n", opts.KeyExpiry)
 
-	listKey = keyPrefix + "list"
-	procKeyPrefix = keyPrefix + "proc:"
-	log.Printf("list key = %#v\n", listKey)
 	return
 }
 
-func prepareProcess(processPath string, workItemKey string, workItem string, argPos int, argAdd bool) *exec.Cmd {
-	var args []string
-	osArgs := os.Args[1:]
-
-	// insert args if requested:
-	if argAdd {
-		args = make([]string, 0, len(osArgs)+1)
-
-		// handle negative values as offset from end of args:
-		if argPos < 0 {
-			argPos += len(osArgs) + 1
+func prepareProcess(opts *Options, workItem string) *exec.Cmd {
+	// build arguments to the executable:
+	osArgs := opts.Args.Rest
+	args := make([]string, 0, len(osArgs))
+	for _, arg := range osArgs {
+		// replace {} token with the work item:
+		if arg == "{}" {
+			arg = workItem
 		}
-		// bounds check:
-		if argPos < 0 {
-			argPos = 0
-		}
-		if argPos > len(osArgs) {
-			argPos = len(osArgs)
-		}
-
-		args = append(args, osArgs[0:argPos]...)
-		args = append(args, workItem)
-		args = append(args, osArgs[argPos:]...)
-	} else {
-		args = osArgs
+		args = append(args, arg)
 	}
 
 	// create a command with path and arguments:
-	cmd := exec.Command(processPath, args...)
+	cmd := exec.Command(opts.Args.Executable, args...)
 
 	// build environment variables:
 	osEnv := os.Environ()
-	env := make([]string, 0, len(osEnv)+2)
-
-	// let the process know the work item and processing key via env vars:
-	env = append(env, fmt.Sprintf("%s=%s", workItemKey, workItem))
-
-	// copy in env vars, filtering out "W8Y_" prefixed keys:
-	for _, kv := range osEnv {
-		if strings.HasPrefix(kv, "W8Y_") {
-			continue
-		}
-
-		env = append(env, kv)
+	var env []string
+	if opts.EnvVar != "" {
+		// let the process know the work item and processing key via env vars:
+		env = make([]string, len(osEnv)+1)
+		env[0] = fmt.Sprintf("%s=%s", opts.EnvVar, workItem)
+		// copy existing env vars:
+		copy(env[1:], osEnv)
+	} else {
+		// copy existing env vars:
+		env = make([]string, len(osEnv))
+		copy(env, osEnv)
 	}
 
 	cmd.Env = env
 
 	// redirect standard file handles:
+	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
 
 	return cmd
 }
