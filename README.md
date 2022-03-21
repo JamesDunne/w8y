@@ -44,11 +44,14 @@ Application Options:
                            redis://localhost:6379)
   -k, --key-prefix=        Redis prefix for all keys
   -x, --key-expiry=        Redis processing key expiry in seconds (default: 5)
+  -e, --env-var=           Environment variable name to set work item to
+  -c, --continuous         Run continuously
+  -i, --exit-codes=        Continue on any of these exit codes returned
+                           (default: 0)
   -q, --quiet              Silence output of w8y to capture pure stdout,stderr
                            of spawned executable
   -f, --log-file=          Log to file
   -t, --no-log-timestamps  Disable inclusion of timestamps in log lines
-  -e, --env-var=           Environment variable name to set work item to
 
 Help Options:
   -h, --help               Show this help message

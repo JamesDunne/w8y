@@ -14,14 +14,19 @@ import (
 )
 
 type Options struct {
-	RedisUrl        string `short:"u" long:"redis-url" default:"redis://localhost:6379" description:"Redis URL to connect to"`
-	KeyPrefix       string `short:"k" long:"key-prefix" description:"Redis prefix for all keys"`
-	KeyExpiry       int    `short:"x" long:"key-expiry" default:"5" description:"Redis processing key expiry in seconds"`
+	RedisUrl  string `short:"u" long:"redis-url" default:"redis://localhost:6379" description:"Redis URL to connect to"`
+	KeyPrefix string `short:"k" long:"key-prefix" description:"Redis prefix for all keys"`
+	KeyExpiry int    `short:"x" long:"key-expiry" default:"5" description:"Redis processing key expiry in seconds"`
+	EnvVar    string `short:"e" long:"env-var" description:"Environment variable name to set work item to"`
+
+	Continuous          bool  `short:"c" long:"continuous" description:"Run continuously"`
+	ContinueOnExitCodes []int `short:"i" long:"exit-codes" default:"0" description:"Continue on any of these exit codes returned"`
+
 	Quiet           bool   `short:"q" long:"quiet" description:"Silence output of w8y to capture pure stdout,stderr of spawned executable"`
 	LogFile         string `short:"f" long:"log-file" description:"Log to file"`
 	NoLogTimestamps bool   `short:"t" long:"no-log-timestamps" description:"Disable inclusion of timestamps in log lines"`
-	EnvVar          string `short:"e" long:"env-var" description:"Environment variable name to set work item to"`
-	Args            struct {
+
+	Args struct {
 		Executable string   `positional-arg-name:"executable"`
 		Rest       []string `positional-arg-name:"args" description:"Arguments to pass to executable; use {} as a placeholder for work item value"`
 	} `positional-args:"true" required:"true"`
@@ -61,33 +66,54 @@ func main() {
 	procKeyPrefix := opts.KeyPrefix + "proc:"
 	log.Printf("list key = %#v\n", listKey)
 
-	// check list length up front so we don't end up circling around the list forever. the list length may change during
-	// iteration but this is okay since we can always restart and pick up the new list size.
-	var listLen int64
-	log.Printf("checking length of %#v\n", listKey)
-	if listLen, err = rds.LLen(ctx, listKey).Result(); err != nil {
-		log.Println(err)
-		os.Exit(2)
-	}
-	log.Printf("length of %#v is %v\n", listKey, listLen)
-	if listLen <= 0 {
-		log.Println("empty; no work to do")
-		os.Exit(0)
-	}
-
 	var exitCode int
 
-	// iterate once through the list of items:
-	for i := int64(0); i < listLen; i++ {
-		var shouldContinue bool
+	if opts.Continuous {
+	loop:
+		for {
+			_, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
 
-		shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+			if err != nil {
+				break
+			}
 
-		if err != nil {
+			// search for exit code in OK list:
+			for _, okExitCode := range opts.ContinueOnExitCodes {
+				if okExitCode == exitCode {
+					continue loop
+				}
+			}
+
+			log.Printf("exit code %d not in continue list\n", exitCode)
 			break
 		}
-		if !shouldContinue {
-			break
+	} else {
+		// check list length up front so we don't end up circling around the list forever. the list length may change during
+		// iteration but this is okay since we can always restart and pick up the new list size.
+		var listLen int64
+		log.Printf("checking length of %#v\n", listKey)
+		if listLen, err = rds.LLen(ctx, listKey).Result(); err != nil {
+			log.Println(err)
+			os.Exit(2)
+		}
+		log.Printf("length of %#v is %v\n", listKey, listLen)
+		if listLen <= 0 {
+			log.Println("empty; no work to do")
+			os.Exit(0)
+		}
+
+		// iterate once through the list of items:
+		for i := int64(0); i < listLen; i++ {
+			var shouldContinue bool
+
+			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+
+			if err != nil {
+				break
+			}
+			if !shouldContinue {
+				break
+			}
 		}
 	}
 
