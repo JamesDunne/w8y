@@ -7,22 +7,28 @@ the executable to provide it with a work item to process via environment variabl
 ## How?
 `w8y` reads work items from a circular redis list until one is available to process.
 
+List keys are named `<prefix:>list`. The `<prefix:>` comes from the command-line argument `--key-prefix`. If not
+supplied it will be blank. Otherwise `w8y` will force it to end in a `:`.
+
 Work items are popped from the left side of the redis circular list and atomically appended to the right side.
 This way, no work items are ever lost or removed from the circular list by `w8y` itself. External redis clients can
 freely manage the circular list by adding or removing work items at any time.
 
-A work item is eligible to process based on the existence of a key named after the list value. If a processing key
-exists for the work item then it is _not_ eligible to be processed.
+A work item is eligible to process if and only if a **processing key** named after the list value does _not_ exist.
+
+Processing keys are named `<prefix:>proc:<work item>`. The value of the work item is included in this key so the
+work item value should be relatively short. Ideally, work items should be simple references like unique identifiers and
+not be the actual work payload to be operated on (e.g. a JSON payload).
 
 If no work item is eligible after traversing the list once then `w8y` returns with exit code 0. The list's
 length is queried before traversal to provide a stopping point.
 
-To mark a work item as being processed, a processing key is created in redis and a background thread is spawned to
-periodically refresh the key to prevent it from expiring. Once this key expires, the work item is eligible for
-processing by the next `w8y` process that picks it up from the circular list.
+The specified executable is spawned to handle the work item as a child process of `w8y`. `w8y` waits for the child
+process to exit and then deletes the processing key from redis. `w8y` finally exits with the child process's exit code.
 
-A specified executable is spawned to handle the work item and `w8y` exits with the spawned process's exit code when
-it completes.
+Before the child process is spawned, the **processing key** is created in redis and a background thread is spawned to
+periodically refresh the key to prevent it from expiring while the child process executes. Once the child process exits,
+the processing key is immediately deleted to free it up for processing by the next `w8y` instance to pick it up.
 
 **Assumptions:**
 * Redis is available

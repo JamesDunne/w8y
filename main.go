@@ -274,7 +274,7 @@ func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComple
 
 	// mark this record as being processed:
 	if _, err = rds.SetEX(ctx, procKey, 1, expiry).Result(); err != nil {
-		log.Printf("SET EX '%s' error: %v\n", procKey, err)
+		log.Printf("SET EX %#v error: %v\n", procKey, err)
 	}
 
 	// every duration, renew the key:
@@ -289,16 +289,22 @@ loop:
 			// push out the expiry time:
 			var updated bool
 			if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
-				log.Printf("EXPIRE '%s' error: %v\n", procKey, err)
-			}
-			if !updated {
-				log.Printf("EXPIRE '%s' was not successfully updated\n", procKey)
+				log.Printf("EXPIRE %#v error: %v\n", procKey, err)
+			} else if !updated {
+				log.Printf("EXPIRE %#v was not successful\n", procKey)
 			}
 		}
 	}
 
 	//log.Printf("stopped keepAlive thread\n")
 	ticker.Stop()
+
+	var ok int64
+	if ok, err = rds.Del(ctx, procKey).Result(); err != nil {
+		log.Printf("DEL %#v error: %v\n", procKey, err)
+	} else if ok == 0 {
+		log.Printf("DEL %#v was not successful: %v\n", procKey)
+	}
 
 	close(done)
 }
