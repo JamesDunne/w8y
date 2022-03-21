@@ -75,78 +75,93 @@ func main() {
 		os.Exit(0)
 	}
 
-	var workItem string
-	var procKeyExists int64 = 1
 	var exitCode int
 
 	// iterate once through the list of items:
 	for i := int64(0); i < listLen; i++ {
-		// pop from left side of list and atomically append to right side of list:
-		if workItem, err = rds.LMove(ctx, listKey, listKey, "left", "right").Result(); err != nil {
-			log.Printf("LMOVE error: %v\n", err)
-			os.Exit(2)
+		var shouldContinue bool
+
+		shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+
+		if err != nil {
+			break
 		}
-
-		// check for existence of processing key:
-		var procKey string
-		procKey = procKeyPrefix + workItem
-		if procKeyExists, err = rds.Exists(ctx, procKey).Result(); err != nil {
-			log.Printf("EXISTS error: %v\n", err)
-			os.Exit(2)
+		if !shouldContinue {
+			break
 		}
-
-		// processing key exists:
-		if procKeyExists != 0 {
-			// keep going through list items, looking for one which is not being processed:
-			log.Printf("work item already processing: %#v\n", workItem)
-			continue
-		}
-
-		// no processing key exists for this item so let's grab it:
-		log.Printf("work item available: %#v\n", workItem)
-
-		// run a keepalive thread in the background:
-		isComplete := make(chan struct{})
-		done := make(chan struct{})
-		go keepAlive(rds, procKey, time.Second*time.Duration(opts.KeyExpiry), isComplete, done)
-
-		// start process:
-		cmd := prepareProcess(opts, workItem)
-		log.Printf("start process: %#v\n", cmd.Args)
-		exitCode = 0
-		if err := cmd.Start(); err != nil {
-			log.Printf("start process error: %v\n", err)
-			exitCode = 2
-			goto maybeContinue
-		}
-
-		// wait for process to exit:
-		err = cmd.Wait()
-
-		// mark completed:
-		close(isComplete)
-
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			// flush remaining stderr:
-			os.Stderr.Write(exitErr.Stderr)
-			exitCode = exitErr.ExitCode()
-		} else if err != nil {
-			log.Println(err)
-			exitCode = 2
-		}
-
-		// wait for keepAlive thread to finish:
-		<-done
-
-	maybeContinue:
-		//if exitCode == 0 {
-		//	continue
-		//}
-
-		break
 	}
 
 	os.Exit(exitCode)
+}
+
+func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKeyPrefix string, opts *Options) (shouldContinue bool, exitCode int, err error) {
+	var procKeyExists int64 = 1
+
+	shouldContinue = false
+	exitCode = -1
+
+	// pop from left side of list and atomically append to right side of list:
+	var workItem string
+	if workItem, err = rds.LMove(ctx, listKey, listKey, "left", "right").Result(); err != nil {
+		log.Printf("LMOVE error: %v\n", err)
+		return
+	}
+
+	// check for existence of processing key:
+	var procKey string
+	procKey = procKeyPrefix + workItem
+	if procKeyExists, err = rds.Exists(ctx, procKey).Result(); err != nil {
+		log.Printf("EXISTS error: %v\n", err)
+		return
+	}
+
+	// processing key exists:
+	if procKeyExists != 0 {
+		// keep going through list items, looking for one which is not being processed:
+		log.Printf("work item already processing: %#v\n", workItem)
+		shouldContinue = true
+		return
+	}
+
+	// no processing key exists for this item so let's grab it:
+	log.Printf("work item available: %#v\n", workItem)
+
+	// run a keepalive thread in the background:
+	isComplete := make(chan struct{})
+	done := make(chan struct{})
+	go keepAlive(rds, procKey, time.Second*time.Duration(opts.KeyExpiry), isComplete, done)
+
+	// start process:
+	cmd := prepareProcess(opts, workItem)
+	log.Printf("start process: %#v\n", cmd.Args)
+	if err = cmd.Start(); err != nil {
+		log.Printf("start process error: %v\n", err)
+		return
+	}
+
+	// wait for process to exit:
+	err = cmd.Wait()
+
+	// mark completed:
+	close(isComplete)
+
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		// flush remaining stderr:
+		os.Stderr.Write(exitErr.Stderr)
+		exitCode = exitErr.ExitCode()
+		err = nil
+	} else if err != nil {
+		log.Printf("exit process error: %v\n", err)
+		exitCode = -1
+	} else {
+		exitCode = 0
+	}
+
+	// wait for keepAlive thread to finish:
+	<-done
+
+	shouldContinue = false
+	return
 }
 
 func setupLogging(opts *Options) (f *os.File) {
