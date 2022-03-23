@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"github.com/go-redis/redis/v8"
 	"github.com/jessevdk/go-flags"
@@ -71,7 +72,11 @@ func main() {
 	if opts.Continuous {
 	loop:
 		for {
-			_, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+			var shouldContinue bool
+			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+			if shouldContinue {
+				continue
+			}
 
 			if err != nil {
 				break
@@ -121,8 +126,6 @@ func main() {
 }
 
 func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKeyPrefix string, opts *Options) (shouldContinue bool, exitCode int, err error) {
-	var procKeyExists int64 = 1
-
 	shouldContinue = false
 	exitCode = -1
 
@@ -134,18 +137,27 @@ func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKey
 	}
 
 	// check for existence of processing key:
-	var procKey string
-	procKey = procKeyPrefix + workItem
-	if procKeyExists, err = rds.Exists(ctx, procKey).Result(); err != nil {
-		log.Printf("EXISTS error: %v\n", err)
-		return
-	}
+	procKey := procKeyPrefix + workItem
+	keyExpiry := time.Second * time.Duration(opts.KeyExpiry)
 
+	var uniqueValue [20]byte
+	_, _ = rand.Read(uniqueValue[:])
+
+	var setResponse string
+	setResponse, err = rds.SetArgs(ctx, procKey, uniqueValue[:], redis.SetArgs{
+		Mode: "NX", // set if not exists
+		TTL:  keyExpiry,
+	}).Result()
 	// processing key exists:
-	if procKeyExists != 0 {
+	if err == redis.Nil || setResponse != "OK" {
+		err = nil
 		// keep going through list items, looking for one which is not being processed:
 		log.Printf("work item already processing: %#v\n", workItem)
 		shouldContinue = true
+		return
+	}
+	if err != nil {
+		log.Printf("SET NX error: %v\n", err)
 		return
 	}
 
@@ -155,7 +167,7 @@ func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKey
 	// run a keepalive thread in the background:
 	isComplete := make(chan struct{})
 	done := make(chan struct{})
-	go keepAlive(rds, procKey, time.Second*time.Duration(opts.KeyExpiry), isComplete, done)
+	go keepAlive(rds, procKey, uniqueValue, keyExpiry, isComplete, done)
 
 	// start process:
 	cmd := prepareProcess(opts, workItem)
@@ -305,18 +317,13 @@ func prepareProcess(opts *Options, workItem string) *exec.Cmd {
 	return cmd
 }
 
-func keepAlive(rds *redis.Client, procKey string, expiry time.Duration, isComplete <-chan struct{}, done chan<- struct{}) {
+func keepAlive(rds *redis.Client, procKey string, uniqueValue [20]byte, expiry time.Duration, isComplete <-chan struct{}, done chan<- struct{}) {
 	var err error
 
 	ctx := context.Background()
 
 	// duration to renew is half of key expiry time:
 	duration := expiry / 2
-
-	// mark this record as being processed:
-	if _, err = rds.SetEX(ctx, procKey, 1, expiry).Result(); err != nil {
-		log.Printf("SET EX %#v error: %v\n", procKey, err)
-	}
 
 	// every duration, renew the key:
 	ticker := time.NewTicker(duration)
@@ -340,11 +347,18 @@ loop:
 	//log.Printf("stopped keepAlive thread\n")
 	ticker.Stop()
 
-	var ok int64
-	if ok, err = rds.Del(ctx, procKey).Result(); err != nil {
+	// safe delete of lock key:
+	var ok int
+	if ok, err = rds.Eval(ctx, `
+if redis.call("get",KEYS[1]) == ARGV[1] then
+    return redis.call("del",KEYS[1])
+else
+    return 0
+end
+`, []string{procKey}, uniqueValue[:]).Int(); err != nil {
 		log.Printf("DEL %#v error: %v\n", procKey, err)
 	} else if ok == 0 {
-		log.Printf("DEL %#v was not successful: %v\n", procKey)
+		log.Printf("DEL %#v was not successful\n", procKey)
 	}
 
 	close(done)
