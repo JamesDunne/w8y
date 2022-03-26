@@ -14,9 +14,9 @@ Work items are popped from the left side of the redis circular list and atomical
 This way, no work items are ever lost or removed from the circular list by `w8y` itself. External redis clients can
 freely manage the circular list by adding or removing work items at any time.
 
-A work item is eligible to process if and only if a **processing key** named after the list value does _not_ exist.
+A work item is eligible to process if and only if a **lock key** named after the list value is taken.
 
-Processing keys are named `<prefix:>proc:<work item>`. The value of the work item is included in this key so the
+Lock keys are named `<prefix:>lock:<work item>`. The value of the work item is included in this key so the
 work item value should be relatively short. Ideally, work items should be simple references like unique identifiers and
 not be the actual work payload to be operated on (e.g. a JSON payload).
 
@@ -24,11 +24,11 @@ If no work item is eligible after traversing the list once then `w8y` returns wi
 length is queried before traversal to provide a stopping point.
 
 The specified executable is spawned to handle the work item as a child process of `w8y`. `w8y` waits for the child
-process to exit and then deletes the processing key from redis. `w8y` finally exits with the child process's exit code.
+process to exit and then deletes the lock key from redis. `w8y` finally exits with the child process's exit code.
 
-Before the child process is spawned, the **processing key** is created in redis and a background thread is spawned to
+Before the child process is spawned, the **lock key** is created in redis and a background thread is spawned to
 periodically refresh the key to prevent it from expiring while the child process executes. Once the child process exits,
-the processing key is immediately deleted to free it up for processing by the next `w8y` instance to pick it up.
+the lock key is immediately deleted to free it up for processing by the next `w8y` instance to pick it up.
 
 **Assumptions:**
 * Redis is available
@@ -43,7 +43,7 @@ Application Options:
   -u, --redis-url=         Redis URL to connect to (default:
                            redis://localhost:6379)
   -k, --key-prefix=        Redis prefix for all keys
-  -x, --key-expiry=        Redis processing key expiry in seconds (default: 5)
+  -x, --key-expiry=        Redis lock key expiry in seconds (default: 5)
   -e, --env-var=           Environment variable name to set work item to
   -c, --continuous         Run continuously
   -i, --exit-codes=        Continue on any of these exit codes returned

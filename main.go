@@ -17,7 +17,7 @@ import (
 type Options struct {
 	RedisUrl  string `short:"u" long:"redis-url" default:"redis://localhost:6379" description:"Redis URL to connect to"`
 	KeyPrefix string `short:"k" long:"key-prefix" description:"Redis prefix for all keys"`
-	KeyExpiry int    `short:"x" long:"key-expiry" default:"5" description:"Redis processing key expiry in seconds"`
+	KeyExpiry int    `short:"x" long:"key-expiry" default:"5" description:"Redis lock key expiry in seconds"`
 	EnvVar    string `short:"e" long:"env-var" description:"Environment variable name to set work item to"`
 
 	Continuous          bool  `short:"c" long:"continuous" description:"Run continuously"`
@@ -64,7 +64,7 @@ func main() {
 	ctx := context.Background()
 
 	listKey := opts.KeyPrefix + "list"
-	procKeyPrefix := opts.KeyPrefix + "proc:"
+	lockKeyPrefix := opts.KeyPrefix + "lock:"
 	log.Printf("list key = %#v\n", listKey)
 
 	var exitCode int
@@ -73,7 +73,7 @@ func main() {
 	loop:
 		for {
 			var shouldContinue bool
-			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, lockKeyPrefix, opts)
 			if shouldContinue {
 				continue
 			}
@@ -111,7 +111,7 @@ func main() {
 		for i := int64(0); i < listLen; i++ {
 			var shouldContinue bool
 
-			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, procKeyPrefix, opts)
+			shouldContinue, exitCode, err = iterateList(ctx, rds, listKey, lockKeyPrefix, opts)
 
 			if err != nil {
 				break
@@ -125,7 +125,7 @@ func main() {
 	os.Exit(exitCode)
 }
 
-func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKeyPrefix string, opts *Options) (shouldContinue bool, exitCode int, err error) {
+func iterateList(ctx context.Context, rds *redis.Client, listKey string, lockKeyPrefix string, opts *Options) (shouldContinue bool, exitCode int, err error) {
 	shouldContinue = false
 	exitCode = -1
 
@@ -136,19 +136,19 @@ func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKey
 		return
 	}
 
-	// check for existence of processing key:
-	procKey := procKeyPrefix + workItem
+	// attempt to take the lock:
+	lockKey := lockKeyPrefix + workItem
 	keyExpiry := time.Second * time.Duration(opts.KeyExpiry)
 
 	var uniqueValue [20]byte
 	_, _ = rand.Read(uniqueValue[:])
 
 	var setResponse string
-	setResponse, err = rds.SetArgs(ctx, procKey, uniqueValue[:], redis.SetArgs{
+	setResponse, err = rds.SetArgs(ctx, lockKey, uniqueValue[:], redis.SetArgs{
 		Mode: "NX", // set if not exists
 		TTL:  keyExpiry,
 	}).Result()
-	// processing key exists:
+	// failed to take lock key:
 	if err == redis.Nil || setResponse != "OK" {
 		err = nil
 		// keep going through list items, looking for one which is not being processed:
@@ -161,13 +161,13 @@ func iterateList(ctx context.Context, rds *redis.Client, listKey string, procKey
 		return
 	}
 
-	// no processing key exists for this item so let's grab it:
+	// we took the lock for this item so let's process it:
 	log.Printf("work item available: %#v\n", workItem)
 
 	// run a keepalive thread in the background:
 	isComplete := make(chan struct{})
 	done := make(chan struct{})
-	go keepAlive(rds, procKey, uniqueValue, keyExpiry, isComplete, done)
+	go keepAlive(rds, lockKey, uniqueValue, keyExpiry, isComplete, done)
 
 	// start process:
 	cmd := prepareProcess(opts, workItem)
@@ -296,7 +296,7 @@ func prepareProcess(opts *Options, workItem string) *exec.Cmd {
 	osEnv := os.Environ()
 	var env []string
 	if opts.EnvVar != "" {
-		// let the process know the work item and processing key via env vars:
+		// let the process know the work item via env vars:
 		env = make([]string, len(osEnv)+1)
 		env[0] = fmt.Sprintf("%s=%s", opts.EnvVar, workItem)
 		// copy existing env vars:
@@ -317,7 +317,7 @@ func prepareProcess(opts *Options, workItem string) *exec.Cmd {
 	return cmd
 }
 
-func keepAlive(rds *redis.Client, procKey string, uniqueValue [20]byte, expiry time.Duration, isComplete <-chan struct{}, done chan<- struct{}) {
+func keepAlive(rds *redis.Client, lockKey string, uniqueValue [20]byte, expiry time.Duration, isComplete <-chan struct{}, done chan<- struct{}) {
 	var err error
 
 	ctx := context.Background()
@@ -336,10 +336,10 @@ loop:
 		case <-ticker.C:
 			// push out the expiry time:
 			var updated bool
-			if updated, err = rds.Expire(ctx, procKey, expiry).Result(); err != nil {
-				log.Printf("EXPIRE %#v error: %v\n", procKey, err)
+			if updated, err = rds.Expire(ctx, lockKey, expiry).Result(); err != nil {
+				log.Printf("EXPIRE %#v error: %v\n", lockKey, err)
 			} else if !updated {
-				log.Printf("EXPIRE %#v was not successful\n", procKey)
+				log.Printf("EXPIRE %#v was not successful\n", lockKey)
 			}
 		}
 	}
@@ -355,10 +355,10 @@ if redis.call("get",KEYS[1]) == ARGV[1] then
 else
     return 0
 end
-`, []string{procKey}, uniqueValue[:]).Int(); err != nil {
-		log.Printf("DEL %#v error: %v\n", procKey, err)
+`, []string{lockKey}, uniqueValue[:]).Int(); err != nil {
+		log.Printf("DEL %#v error: %v\n", lockKey, err)
 	} else if ok == 0 {
-		log.Printf("DEL %#v was not successful\n", procKey)
+		log.Printf("DEL %#v was not successful\n", lockKey)
 	}
 
 	close(done)
