@@ -7,7 +7,7 @@ import (
 	"github.com/go-redis/redis/v8"
 	"github.com/jessevdk/go-flags"
 	"io"
-	"log"
+	logger "log"
 	"os"
 	"os/exec"
 	"strings"
@@ -32,6 +32,10 @@ type Options struct {
 		Rest       []string `positional-arg-name:"args" description:"Arguments to pass to executable; use {} as a placeholder for work item value"`
 	} `positional-args:"true" required:"true"`
 }
+
+var (
+	log *logger.Logger
+)
 
 func main() {
 	var err error
@@ -206,28 +210,31 @@ func setupLogging(opts *Options) (f *os.File) {
 	silence := opts.Quiet
 
 	var logOut io.Writer = io.Discard
+	if fname := opts.LogFile; fname != "" {
+		var err error
+		f, err = os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+		if err != nil {
+			fmt.Printf("failed to open file for writing: %v\n", fname)
+			os.Exit(2)
+		}
+		logOut = f
+	}
+
 	if !silence {
-		if fname := opts.LogFile; fname != "" {
-			var err error
-			f, err = os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
-			if err != nil {
-				fmt.Printf("failed to open file for writing: %v\n", fname)
-				os.Exit(2)
-			}
-			logOut = f
+		if logOut != nil {
+			logOut = io.MultiWriter(logOut, os.Stderr)
 		} else {
 			logOut = os.Stderr
 		}
 	}
 
+	fl := 0
 	if opts.NoLogTimestamps {
-		log.SetFlags(0)
+		fl = 0
 	} else {
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.LUTC)
+		fl = logger.LstdFlags | logger.Lmicroseconds | logger.LUTC
 	}
-
-	log.SetPrefix("w8y: ")
-	log.SetOutput(logOut)
+	log = logger.New(logOut, "w8y: ", fl)
 
 	return
 }
