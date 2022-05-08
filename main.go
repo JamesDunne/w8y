@@ -41,7 +41,7 @@ func main() {
 	var err error
 
 	opts := &Options{}
-	_, err = flags.NewParser(opts, flags.HelpFlag).Parse()
+	_, err = flags.NewParser(opts, flags.HelpFlag|flags.PassDoubleDash).Parse()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return
