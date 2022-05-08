@@ -290,9 +290,7 @@ func prepareProcess(opts *Options, workItem string) *exec.Cmd {
 	args := make([]string, 0, len(osArgs))
 	for _, arg := range osArgs {
 		// replace {} token with the work item:
-		if arg == "{}" {
-			arg = workItem
-		}
+		arg = strings.ReplaceAll(arg, "{}", workItem)
 		args = append(args, arg)
 	}
 
